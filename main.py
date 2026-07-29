@@ -158,11 +158,16 @@ def main():
     # Format Telegram Message
     if alert_assets and bot_token and chat_id:
         msg_lines = ["📊 *COT Positioning Alert (|Z| ≥ 1.0)*\n"]
+        
         for item in alert_assets:
+            # Color logic: Red for Positive (+), Green for Negative (-)
+            icon_1y = "🔴" if item['z_1y'] > 0 else "🟢"
+            icon_hist = "🔴" if item['z_hist'] > 0 else "🟢"
+
             msg_lines.append(
                 f"• *{item['name']}*\n"
-                f"   └ 1Y Z-Score: `{item['z_1y']:+.2f}`\n"
-                f"   └ Since 2018 Z-Score: `{item['z_hist']:+.2f}`"
+                f"   └ 1Y Z-Score: {icon_1y} `{item['z_1y']:+.2f}`\n"
+                f"   └ Since 2018 Z-Score: {icon_hist} `{item['z_hist']:+.2f}`"
             )
         
         full_message = "\n".join(msg_lines)
