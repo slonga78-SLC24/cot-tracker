@@ -1,13 +1,14 @@
 import os
 import json
 import datetime
+import urllib.parse
+import urllib.request
 import numpy as np
 import pandas as pd
 import cot_reports as cot
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Exact CFTC Market Names in Legacy Reports
 EXACT_ASSET_MAP = {
     "S&P 500 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE": "S&P 500",
     "NASDAQ-100 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE": "Nasdaq 100",
@@ -36,9 +37,33 @@ def compute_z_score(latest, mean, std):
         return 0.0
     return round((latest - mean) / std, 2)
 
+def send_telegram_alert(bot_token, chat_id, message):
+    if not bot_token or not chat_id:
+        print("Telegram credentials missing. Skipping alert.")
+        return
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(url, data=payload)
+        with urllib.request.urlopen(req) as response:
+            if response.status == 200:
+                print("Telegram alert sent successfully!")
+            else:
+                print(f"Failed to send Telegram alert: Status {response.status}")
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
+
 def main():
     creds_json = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
     sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
     if not creds_json or not sheet_id:
         raise ValueError("Missing environment variables for Google authentication.")
@@ -72,13 +97,12 @@ def main():
     short_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'short' in c.lower()), None)
 
     summary_rows = []
+    alert_assets = []
 
     for exact_cftc_name, clean_name in EXACT_ASSET_MAP.items():
-        # Strip whitespace for exact comparison
         asset_df = df_raw[df_raw[name_col].astype(str).str.strip() == exact_cftc_name].copy()
 
         if asset_df.empty:
-            print(f"FAILED TO MATCH: {clean_name} (Looked for: '{exact_cftc_name}')")
             continue
 
         asset_df['Net_Pos'] = asset_df[long_col] - asset_df[short_col]
@@ -110,6 +134,14 @@ def main():
             int(avg_hist), int(min_hist), int(max_hist), z_hist
         ])
 
+        # Flag if 1Y OR Historical Z-Score is >= 1.0 or <= -1.0
+        if abs(z_1y) >= 1.0 or abs(z_hist) >= 1.0:
+            alert_assets.append({
+                "name": clean_name,
+                "z_1y": z_1y,
+                "z_hist": z_hist
+            })
+
     headers = [
         "Non Commercials Net Long", "Latest", "W/W Chg", "3M Avg",
         "1Y Avg", "1Y Min", "1Y Max", "1Y Z-Score",
@@ -122,6 +154,21 @@ def main():
     
     worksheet.update('A1', [headers] + summary_rows)
     print("Sheet updated!")
+
+    # Format Telegram Message
+    if alert_assets and bot_token and chat_id:
+        msg_lines = ["📊 *COT Positioning Alert (|Z| ≥ 1.0)*\n"]
+        for item in alert_assets:
+            msg_lines.append(
+                f"• *{item['name']}*\n"
+                f"   └ 1Y Z-Score: `{item['z_1y']:+.2f}`\n"
+                f"   └ Since 2018 Z-Score: `{item['z_hist']:+.2f}`"
+            )
+        
+        full_message = "\n".join(msg_lines)
+        send_telegram_alert(bot_token, chat_id, full_message)
+    elif not alert_assets:
+        print("No assets triggered the Z-score threshold (|Z| >= 1.0).")
 
 if __name__ == "__main__":
     main()
