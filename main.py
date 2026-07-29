@@ -57,9 +57,10 @@ def main():
     years = list(range(2018, current_year + 1))
     
     df_list = []
-    for y in years:
+  for y in years:
         try:
-            df_year = cot.cot_year(year=y, cot_type='financial')
+            # Use 'traders_in_financial_futures_fut' or 'legacy_fut'
+            df_year = cot.cot_year(year=y, cot_report_type='traders_in_financial_futures_fut')
             df_list.append(df_year)
         except Exception as e:
             print(f"Warning year {y}: {e}")
