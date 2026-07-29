@@ -1,0 +1,5 @@
+pandas
+numpy
+cot-reports
+gspread
+google-auth
