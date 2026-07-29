@@ -7,31 +7,28 @@ import cot_reports as cot
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Keyword mapping for contract search
-ASSET_KEYWORDS = {
-    "S&P 500": "S&P 500",
-    "NASDAQ-100": "Nasdaq 100",
-    "RUSSELL E-MINI": "Russell 2000",
-    "VIX FUTURES": "VIX",
-    "MSCI EMERGING": "MSCI EM",
-    "30-DAY FEDERAL": "30d Fed Funds",
-    "2-YEAR TREASURY": "2y Treasury",
-    "5-YEAR TREASURY": "5y Treasury",
-    "10-YEAR TREASURY": "10y Treasury",
-    "U.S. TREASURY BONDS": "Treasury Bonds",
-    "U.S. DOLLAR INDEX": "USD",
-    "EURO FX": "EUR",
-    "BRITISH POUND": "GBP",
-    "JAPANESE YEN": "JPY",
-    "AUSTRALIAN DOLLAR": "AUS",
-    "CANADIAN DOLLAR": "CAD",
-    "BRAZILIAN REAL": "BRL",
-    "BITCOIN": "Bitcoin",
-    "GOLD": "Gold",
-    "SILVER": "Silver",
-    "COPPER": "Copper",
-    "CRUDE OIL": "Crude Oil",
-    "WHEAT": "Wheat"
+# Exact CFTC Market Names in Legacy Reports
+EXACT_ASSET_MAP = {
+    "S&P 500 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE": "S&P 500",
+    "NASDAQ-100 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE": "Nasdaq 100",
+    "RUSSELL 2000 MINI INDEX FUTURE - CHICAGO MERCANTILE EXCHANGE": "Russell 2000",
+    "VIX FUTURES - CBOE FUTURES EXCHANGE": "VIX",
+    "MSCI EMERGING MARKETS INDEX - CHICAGO MERCANTILE EXCHANGE": "MSCI EM",
+    "30-DAY FEDERAL FUNDS - CHICAGO BOARD OF TRADE": "30d Fed Funds",
+    "U.S. TREASURY BONDS - CHICAGO BOARD OF TRADE": "Treasury Bonds",
+    "U.S. DOLLAR INDEX - ICE FUTURES U.S.": "USD",
+    "EURO FX - CHICAGO MERCANTILE EXCHANGE": "EUR",
+    "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE": "GBP",
+    "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE": "JPY",
+    "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "AUS",
+    "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "CAD",
+    "BRAZILIAN REAL - CHICAGO MERCANTILE EXCHANGE": "BRL",
+    "BITCOIN - CHICAGO MERCANTILE EXCHANGE": "Bitcoin",
+    "GOLD - COMMODITY EXCHANGE INC.": "Gold",
+    "SILVER - COMMODITY EXCHANGE INC.": "Silver",
+    "COPPER - COMMODITY EXCHANGE INC.": "Copper",
+    "CRUDE OIL LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE": "Crude Oil",
+    "WHEAT - CHICAGO BOARD OF TRADE": "Wheat"
 }
 
 def compute_z_score(latest, mean, std):
@@ -65,30 +62,23 @@ def main():
 
     df_raw = pd.concat(df_list, ignore_index=True)
 
-    # Dynamic Column Detection (handles variations in CFTC headers)
     date_col = next((c for c in df_raw.columns if 'date' in c.lower() or 'yymmdd' in c.lower()), None)
     name_col = next((c for c in df_raw.columns if 'market' in c.lower() or 'name' in c.lower()), None)
-
-    if not date_col or not name_col:
-        raise KeyError(f"Could not locate date/name columns. Available columns: {list(df_raw.columns)}")
 
     df_raw[date_col] = pd.to_datetime(df_raw[date_col])
     df_raw = df_raw.sort_values(date_col)
 
-    # Identify Long and Short columns dynamically for Non-Commercials
     long_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'long' in c.lower()), None)
     short_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'short' in c.lower()), None)
 
-    if not long_col or not short_col:
-        raise KeyError("Non-Commercial long/short columns not found in dataframe.")
-
     summary_rows = []
 
-    for keyword, clean_name in ASSET_KEYWORDS.items():
-        mask = df_raw[name_col].astype(str).str.contains(keyword, case=False, na=False)
-        asset_df = df_raw[mask].copy()
+    for exact_cftc_name, clean_name in EXACT_ASSET_MAP.items():
+        # Strip whitespace for exact comparison
+        asset_df = df_raw[df_raw[name_col].astype(str).str.strip() == exact_cftc_name].copy()
 
         if asset_df.empty:
+            print(f"FAILED TO MATCH: {clean_name} (Looked for: '{exact_cftc_name}')")
             continue
 
         asset_df['Net_Pos'] = asset_df[long_col] - asset_df[short_col]
@@ -131,7 +121,7 @@ def main():
     worksheet.clear()
     
     worksheet.update('A1', [headers] + summary_rows)
-    print("Google Sheet updated successfully with data!")
+    print("Sheet updated!")
 
 if __name__ == "__main__":
     main()
