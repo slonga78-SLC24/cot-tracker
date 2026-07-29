@@ -7,8 +7,7 @@ import cot_reports as cot
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Unified contract search keywords (case-insensitive search)
-# This prevents broken matches if CFTC changes minor spacing or wording
+# Keyword mapping for contract search
 ASSET_KEYWORDS = {
     "S&P 500": "S&P 500",
     "NASDAQ-100": "Nasdaq 100",
@@ -56,7 +55,6 @@ def main():
     current_year = datetime.datetime.now().year
     years = list(range(2018, current_year + 1))
     
-    # Use Legacy Futures report as primary source (covers Financials + Commodities)
     df_list = []
     for y in years:
         try:
@@ -66,25 +64,34 @@ def main():
             print(f"Warning year {y}: {e}")
 
     df_raw = pd.concat(df_list, ignore_index=True)
-    df_raw['As_of_Date_In_Form_YYMMDD'] = pd.to_datetime(df_raw['As_of_Date_In_Form_YYMMDD'])
-    df_raw = df_raw.sort_values('As_of_Date_In_Form_YYMMDD')
+
+    # Dynamic Column Detection (handles variations in CFTC headers)
+    date_col = next((c for c in df_raw.columns if 'date' in c.lower() or 'yymmdd' in c.lower()), None)
+    name_col = next((c for c in df_raw.columns if 'market' in c.lower() or 'name' in c.lower()), None)
+
+    if not date_col or not name_col:
+        raise KeyError(f"Could not locate date/name columns. Available columns: {list(df_raw.columns)}")
+
+    df_raw[date_col] = pd.to_datetime(df_raw[date_col])
+    df_raw = df_raw.sort_values(date_col)
+
+    # Identify Long and Short columns dynamically for Non-Commercials
+    long_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'long' in c.lower()), None)
+    short_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'short' in c.lower()), None)
+
+    if not long_col or not short_col:
+        raise KeyError("Non-Commercial long/short columns not found in dataframe.")
 
     summary_rows = []
 
     for keyword, clean_name in ASSET_KEYWORDS.items():
-        # Fuzzy match contract names
-        mask = df_raw['Market_and_Exchange_Names'].str.contains(keyword, case=False, na=False)
+        mask = df_raw[name_col].astype(str).str.contains(keyword, case=False, na=False)
         asset_df = df_raw[mask].copy()
 
         if asset_df.empty:
             continue
 
-        # Non-Commercial (Speculator) Net Position calculation
-        if 'NonComm_Positions_Long_All' in asset_df.columns and 'NonComm_Positions_Short_All' in asset_df.columns:
-            asset_df['Net_Pos'] = asset_df['NonComm_Positions_Long_All'] - asset_df['NonComm_Positions_Short_All']
-        else:
-            continue
-
+        asset_df['Net_Pos'] = asset_df[long_col] - asset_df[short_col]
         net_series = asset_df['Net_Pos'].dropna()
         if len(net_series) == 0:
             continue
