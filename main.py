@@ -7,31 +7,32 @@ import cot_reports as cot
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- 1. CFTC CONTRACT MAPPING ---
-ASSET_MAP = {
-    "S&P 500 CONSOLIDATED - CHICAGO MERCANTILE EXCHANGE": "S&P 500",
-    "NASDAQ-100 CONSOLIDATED - CHICAGO MERCANTILE EXCHANGE": "Nasdaq 100",
-    "RUSSELL E-MINI - CHICAGO MERCANTILE EXCHANGE": "Russell 2000",
-    "VIX FUTURES - CBOE FUTURES EXCHANGE": "VIX",
-    "MSCI EMERGING MARKETS INDEX - CHICAGO MERCANTILE EXCHANGE": "MSCI EM",
-    "30-DAY FEDERAL FUNDS - CHICAGO BOARD OF TRADE": "30d Fed Funds",
-    "2-YEAR TREASURY NOTES - CHICAGO BOARD OF TRADE": "2y Treasury",
-    "5-YEAR TREASURY NOTES - CHICAGO BOARD OF TRADE": "5y Treasury",
-    "10-YEAR TREASURY NOTES - CHICAGO BOARD OF TRADE": "10y Treasury",
-    "U.S. TREASURY BONDS - CHICAGO BOARD OF TRADE": "Treasury Bonds",
-    "U.S. DOLLAR INDEX - ICE FUTURES U.S.": "USD",
-    "EURO FX - CHICAGO MERCANTILE EXCHANGE": "EUR",
-    "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE": "GBP",
-    "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE": "JPY",
-    "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "AUS",
-    "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "CAD",
-    "BRAZILIAN REAL - CHICAGO MERCANTILE EXCHANGE": "BRL",
-    "BITCOIN - CHICAGO MERCANTILE EXCHANGE": "Bitcoin",
-    "GOLD - COMMODITY EXCHANGE INC.": "Gold",
-    "SILVER - COMMODITY EXCHANGE INC.": "Silver",
-    "COPPER - COMMODITY EXCHANGE INC.": "Copper",
-    "CRUDE OIL - NEW YORK MERCANTILE EXCHANGE": "Crude Oil",
-    "WHEAT - CHICAGO BOARD OF TRADE": "Wheat"
+# Unified contract search keywords (case-insensitive search)
+# This prevents broken matches if CFTC changes minor spacing or wording
+ASSET_KEYWORDS = {
+    "S&P 500": "S&P 500",
+    "NASDAQ-100": "Nasdaq 100",
+    "RUSSELL E-MINI": "Russell 2000",
+    "VIX FUTURES": "VIX",
+    "MSCI EMERGING": "MSCI EM",
+    "30-DAY FEDERAL": "30d Fed Funds",
+    "2-YEAR TREASURY": "2y Treasury",
+    "5-YEAR TREASURY": "5y Treasury",
+    "10-YEAR TREASURY": "10y Treasury",
+    "U.S. TREASURY BONDS": "Treasury Bonds",
+    "U.S. DOLLAR INDEX": "USD",
+    "EURO FX": "EUR",
+    "BRITISH POUND": "GBP",
+    "JAPANESE YEN": "JPY",
+    "AUSTRALIAN DOLLAR": "AUS",
+    "CANADIAN DOLLAR": "CAD",
+    "BRAZILIAN REAL": "BRL",
+    "BITCOIN": "Bitcoin",
+    "GOLD": "Gold",
+    "SILVER": "Silver",
+    "COPPER": "Copper",
+    "CRUDE OIL": "Crude Oil",
+    "WHEAT": "Wheat"
 }
 
 def compute_z_score(latest, mean, std):
@@ -40,7 +41,6 @@ def compute_z_score(latest, mean, std):
     return round((latest - mean) / std, 2)
 
 def main():
-    # Load Google Credentials from Environment Variable
     creds_json = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
     sheet_id = os.environ.get("GOOGLE_SHEET_ID")
 
@@ -56,10 +56,11 @@ def main():
     current_year = datetime.datetime.now().year
     years = list(range(2018, current_year + 1))
     
+    # Use Legacy Futures report as primary source (covers Financials + Commodities)
     df_list = []
     for y in years:
         try:
-            df_year = cot.cot_year(year=y, cot_report_type='traders_in_financial_futures_fut')
+            df_year = cot.cot_year(year=y, cot_report_type='legacy_fut')
             df_list.append(df_year)
         except Exception as e:
             print(f"Warning year {y}: {e}")
@@ -70,15 +71,17 @@ def main():
 
     summary_rows = []
 
-    for cftc_name, clean_name in ASSET_MAP.items():
-        asset_df = df_raw[df_raw['Market_and_Exchange_Names'] == cftc_name].copy()
+    for keyword, clean_name in ASSET_KEYWORDS.items():
+        # Fuzzy match contract names
+        mask = df_raw['Market_and_Exchange_Names'].str.contains(keyword, case=False, na=False)
+        asset_df = df_raw[mask].copy()
+
         if asset_df.empty:
             continue
 
-        if 'NonComm_Positions_Long_All' in asset_df.columns:
+        # Non-Commercial (Speculator) Net Position calculation
+        if 'NonComm_Positions_Long_All' in asset_df.columns and 'NonComm_Positions_Short_All' in asset_df.columns:
             asset_df['Net_Pos'] = asset_df['NonComm_Positions_Long_All'] - asset_df['NonComm_Positions_Short_All']
-        elif 'Asset_Manager_Positions_Long_All' in asset_df.columns:
-            asset_df['Net_Pos'] = asset_df['Asset_Manager_Positions_Long_All'] - asset_df['Asset_Manager_Positions_Short_All']
         else:
             continue
 
@@ -110,7 +113,6 @@ def main():
             int(avg_hist), int(min_hist), int(max_hist), z_hist
         ])
 
-    # Convert to Dataframe for easy export
     headers = [
         "Non Commercials Net Long", "Latest", "W/W Chg", "3M Avg",
         "1Y Avg", "1Y Min", "1Y Max", "1Y Z-Score",
@@ -121,9 +123,8 @@ def main():
     worksheet = sh.sheet1
     worksheet.clear()
     
-    # Update Google Sheet
     worksheet.update('A1', [headers] + summary_rows)
-    print("Google Sheet updated successfully!")
+    print("Google Sheet updated successfully with data!")
 
 if __name__ == "__main__":
     main()
