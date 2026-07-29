@@ -9,7 +9,7 @@ import cot_reports as cot
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Mapping clean display names to possible CFTC contract string patterns
+# Asset mapping covering dynamic CFTC contract naming variations
 ASSET_PATTERNS = {
     "S&P 500": ["E-MINI S&P 500", "S&P 500 STOCK INDEX"],
     "Nasdaq 100": ["NASDAQ-100 STOCK INDEX", "E-MINI NASDAQ-100"],
@@ -46,6 +46,23 @@ def compute_z_score(latest, mean, std):
     if std == 0 or pd.isna(std):
         return 0.0
     return round((latest - mean) / std, 2)
+
+def get_trading_permissions(z_1y):
+    """
+    Determines directional trading permissions based on 1Y Z-Score Regimes:
+    - Z <= -2.0 : Bullish Capitulation (LONG-ONLY)
+    - Z >= +2.0 : Overbought / Squeeze Risk (SHORT-ONLY / NO LONGS)
+    - +1.0 <= Z < +2.0 : Bullish Trend (LONG-ONLY / DIP BUYING)
+    - Else : Neutral Zone (UNRESTRICTED)
+    """
+    if z_1y <= -2.0:
+        return "BULLISH CAPITULATION", "🟢 LONG-ONLY (High Conviction)"
+    elif z_1y >= 2.0:
+        return "BEARISH OVERBOUGHT", "🔴 SHORT-ONLY / NO LONGS"
+    elif z_1y >= 1.0:
+        return "BULLISH TREND", "🟢 LONG-ONLY (Dip Buying)"
+    else:
+        return "NEUTRAL ZONE", "⚪ UNRESTRICTED (Both Long & Short)"
 
 def send_telegram_alert(bot_token, chat_id, message):
     if not bot_token or not chat_id:
@@ -102,12 +119,11 @@ def main():
     long_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'long' in c.lower()), None)
     short_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'short' in c.lower()), None)
 
-    # Clean dates and calculated net positions
+    # Clean dates and net positions
     df_raw['Clean_Date'] = parse_cot_dates(df_raw[date_col])
     df_raw['Market_Upper'] = df_raw[name_col].astype(str).str.strip().str.upper()
     df_raw['Net_Pos'] = df_raw[long_col] - df_raw[short_col]
 
-    # Map raw names to target clean assets
     def map_asset(market_str):
         for clean_name, patterns in ASSET_PATTERNS.items():
             if any(p in market_str for p in patterns):
@@ -117,7 +133,6 @@ def main():
     df_raw['Clean_Asset'] = df_raw['Market_Upper'].apply(map_asset)
     df_filtered = df_raw.dropna(subset=['Clean_Asset', 'Clean_Date', 'Net_Pos']).copy()
 
-    # Pivot to align weekly time series per asset
     pivot_net = df_filtered.pivot_table(
         index='Clean_Date', 
         columns='Clean_Asset', 
@@ -127,6 +142,7 @@ def main():
 
     summary_rows = []
     alert_assets = []
+    permission_rows = []
 
     for clean_name in ASSET_PATTERNS.keys():
         if clean_name not in pivot_net.columns:
@@ -142,7 +158,7 @@ def main():
 
         avg_3m = net_series.tail(12).mean()
 
-        # 1Y Metrics (52 weeks)
+        # 1Y Metrics
         net_1y = net_series.tail(52)
         avg_1y, min_1y, max_1y, std_1y = net_1y.mean(), net_1y.min(), net_1y.max(), net_1y.std()
         z_1y = compute_z_score(latest_val, avg_1y, std_1y)
@@ -151,16 +167,29 @@ def main():
         avg_hist, min_hist, max_hist, std_hist = net_series.mean(), net_series.min(), net_series.max(), net_series.std()
         z_hist = compute_z_score(latest_val, avg_hist, std_hist)
 
+        # Get Regime and Directional Permission
+        regime, permission = get_trading_permissions(z_1y)
+
         summary_rows.append([
             clean_name,
             int(latest_val),
             int(ww_change) if not pd.isna(ww_change) else 0,
             int(avg_3m),
             int(avg_1y), int(min_1y), int(max_1y), z_1y,
-            int(avg_hist), int(min_hist), int(max_hist), z_hist
+            int(avg_hist), int(min_hist), int(max_hist), z_hist,
+            permission
         ])
 
-        # Flag if 1Y OR Historical Z-Score is >= 1.0 or <= -1.0
+        # Store permission status for key trading assets in Telegram summary
+        if clean_name in ["S&P 500", "Nasdaq 100", "Russell 2000", "USD", "Gold"]:
+            permission_rows.append({
+                "name": clean_name,
+                "z_1y": z_1y,
+                "regime": regime,
+                "permission": permission
+            })
+
+        # Flag threshold alerts (|Z| >= 1.0)
         if abs(z_1y) >= 1.0 or abs(z_hist) >= 1.0:
             alert_assets.append({
                 "name": clean_name,
@@ -171,7 +200,8 @@ def main():
     headers = [
         "Non Commercials Net Long", "Latest", "W/W Chg", "3M Avg",
         "1Y Avg", "1Y Min", "1Y Max", "1Y Z-Score",
-        "Since 2018 Avg", "Since 2018 Min", "Since 2018 Max", "Since 2018 Z-Score"
+        "Since 2018 Avg", "Since 2018 Min", "Since 2018 Max", "Since 2018 Z-Score",
+        "System Directional Permission"
     ]
 
     sh = gc.open_by_key(sheet_id)
@@ -182,24 +212,30 @@ def main():
     print("Sheet updated!")
 
     # Format Telegram Message
-    if alert_assets and bot_token and chat_id:
-        msg_lines = ["📊 *COT Positioning Alert (|Z| ≥ 1.0)*\n"]
+    if bot_token and chat_id:
+        msg_lines = ["📊 *COT POSITIONING & SYSTEM PERMISSIONS*\n"]
         
-        for item in alert_assets:
-            # Color logic: Red for Positive (+), Green for Negative (-)
-            icon_1y = "🔴" if item['z_1y'] > 0 else "🟢"
-            icon_hist = "🔴" if item['z_hist'] > 0 else "🟢"
-
+        # SECTION 1: Directional System Permissions
+        msg_lines.append("🎯 *System Trading Permissions (SPY/QQQ/Macro):*")
+        for p in permission_rows:
             msg_lines.append(
-                f"• *{item['name']}*\n"
-                f"   └ 1Y Z-Score: {icon_1y} `{item['z_1y']:+.2f}`\n"
-                f"   └ Since 2018 Z-Score: {icon_hist} `{item['z_hist']:+.2f}`"
+                f"• *{p['name']}* (`1Y Z: {p['z_1y']:+.2f}`)\n"
+                f"   └ Rule: *{p['permission']}*"
             )
         
+        # SECTION 2: Active Threshold Alerts
+        if alert_assets:
+            msg_lines.append("\n🚨 *Active Z-Score Alerts (|Z| ≥ 1.0):*")
+            for item in alert_assets:
+                icon_1y = "🔴" if item['z_1y'] > 0 else "🟢"
+                icon_hist = "🔴" if item['z_hist'] > 0 else "🟢"
+                msg_lines.append(
+                    f"• *{item['name']}*\n"
+                    f"   └ 1Y Z-Score: {icon_1y} `{item['z_1y']:+.2f}` | Since 2018: {icon_hist} `{item['z_hist']:+.2f}`"
+                )
+
         full_message = "\n".join(msg_lines)
         send_telegram_alert(bot_token, chat_id, full_message)
-    elif not alert_assets:
-        print("No assets triggered the Z-score threshold (|Z| >= 1.0).")
 
 if __name__ == "__main__":
     main()
