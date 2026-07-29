@@ -9,28 +9,38 @@ import cot_reports as cot
 import gspread
 from google.oauth2.service_account import Credentials
 
-EXACT_ASSET_MAP = {
-    "S&P 500 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE": "S&P 500",
-    "NASDAQ-100 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE": "Nasdaq 100",
-    "RUSSELL 2000 MINI INDEX FUTURE - CHICAGO MERCANTILE EXCHANGE": "Russell 2000",
-    "VIX FUTURES - CBOE FUTURES EXCHANGE": "VIX",
-    "MSCI EMERGING MARKETS INDEX - CHICAGO MERCANTILE EXCHANGE": "MSCI EM",
-    "30-DAY FEDERAL FUNDS - CHICAGO BOARD OF TRADE": "30d Fed Funds",
-    "U.S. TREASURY BONDS - CHICAGO BOARD OF TRADE": "Treasury Bonds",
-    "U.S. DOLLAR INDEX - ICE FUTURES U.S.": "USD",
-    "EURO FX - CHICAGO MERCANTILE EXCHANGE": "EUR",
-    "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE": "GBP",
-    "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE": "JPY",
-    "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "AUS",
-    "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "CAD",
-    "BRAZILIAN REAL - CHICAGO MERCANTILE EXCHANGE": "BRL",
-    "BITCOIN - CHICAGO MERCANTILE EXCHANGE": "Bitcoin",
-    "GOLD - COMMODITY EXCHANGE INC.": "Gold",
-    "SILVER - COMMODITY EXCHANGE INC.": "Silver",
-    "COPPER - COMMODITY EXCHANGE INC.": "Copper",
-    "CRUDE OIL LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE": "Crude Oil",
-    "WHEAT - CHICAGO BOARD OF TRADE": "Wheat"
+# Mapping clean display names to possible CFTC contract string patterns
+ASSET_PATTERNS = {
+    "S&P 500": ["E-MINI S&P 500", "S&P 500 STOCK INDEX"],
+    "Nasdaq 100": ["NASDAQ-100 STOCK INDEX", "E-MINI NASDAQ-100"],
+    "Russell 2000": ["RUSSELL 2000 MINI INDEX", "E-MINI RUSSELL 2000"],
+    "VIX": ["VIX FUTURES"],
+    "MSCI EM": ["MSCI EMERGING MARKETS INDEX"],
+    "30d Fed Funds": ["30-DAY FEDERAL FUNDS"],
+    "Treasury Bonds": ["U.S. TREASURY BONDS"],
+    "USD": ["U.S. DOLLAR INDEX", "USD INDEX"],
+    "EUR": ["EURO FX"],
+    "GBP": ["BRITISH POUND"],
+    "JPY": ["JAPANESE YEN"],
+    "AUS": ["AUSTRALIAN DOLLAR"],
+    "CAD": ["CANADIAN DOLLAR"],
+    "BRL": ["BRAZILIAN REAL"],
+    "Bitcoin": ["BITCOIN"],
+    "Gold": ["GOLD - COMMODITY EXCHANGE"],
+    "Silver": ["SILVER - COMMODITY EXCHANGE"],
+    "Copper": ["COPPER - COMMODITY EXCHANGE"],
+    "Crude Oil": ["CRUDE OIL, LIGHT SWEET", "CRUDE OIL LIGHT SWEET"],
+    "Wheat": ["WHEAT - CHICAGO BOARD OF TRADE"]
 }
+
+def parse_cot_dates(series):
+    """Safely converts dynamic CFTC date columns (YYMMDD vs YYYY-MM-DD) to datetime."""
+    str_series = series.astype(str).str.split('.').str[0].str.strip()
+    sample_val = str_series.dropna().iloc[0] if not str_series.dropna().empty else ""
+    if len(sample_val) == 6 and sample_val.isdigit():
+        return pd.to_datetime(str_series, format='%y%m%d', errors='coerce')
+    else:
+        return pd.to_datetime(str_series, errors='coerce')
 
 def compute_z_score(latest, mean, std):
     if std == 0 or pd.isna(std):
@@ -89,24 +99,40 @@ def main():
 
     date_col = next((c for c in df_raw.columns if 'date' in c.lower() or 'yymmdd' in c.lower()), None)
     name_col = next((c for c in df_raw.columns if 'market' in c.lower() or 'name' in c.lower()), None)
-
-    df_raw[date_col] = pd.to_datetime(df_raw[date_col])
-    df_raw = df_raw.sort_values(date_col)
-
     long_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'long' in c.lower()), None)
     short_col = next((c for c in df_raw.columns if 'noncomm' in c.lower() and 'short' in c.lower()), None)
+
+    # Clean dates and calculated net positions
+    df_raw['Clean_Date'] = parse_cot_dates(df_raw[date_col])
+    df_raw['Market_Upper'] = df_raw[name_col].astype(str).str.strip().str.upper()
+    df_raw['Net_Pos'] = df_raw[long_col] - df_raw[short_col]
+
+    # Map raw names to target clean assets
+    def map_asset(market_str):
+        for clean_name, patterns in ASSET_PATTERNS.items():
+            if any(p in market_str for p in patterns):
+                return clean_name
+        return None
+
+    df_raw['Clean_Asset'] = df_raw['Market_Upper'].apply(map_asset)
+    df_filtered = df_raw.dropna(subset=['Clean_Asset', 'Clean_Date', 'Net_Pos']).copy()
+
+    # Pivot to align weekly time series per asset
+    pivot_net = df_filtered.pivot_table(
+        index='Clean_Date', 
+        columns='Clean_Asset', 
+        values='Net_Pos', 
+        aggfunc='max'
+    ).sort_index()
 
     summary_rows = []
     alert_assets = []
 
-    for exact_cftc_name, clean_name in EXACT_ASSET_MAP.items():
-        asset_df = df_raw[df_raw[name_col].astype(str).str.strip() == exact_cftc_name].copy()
-
-        if asset_df.empty:
+    for clean_name in ASSET_PATTERNS.keys():
+        if clean_name not in pivot_net.columns:
             continue
 
-        asset_df['Net_Pos'] = asset_df[long_col] - asset_df[short_col]
-        net_series = asset_df['Net_Pos'].dropna()
+        net_series = pivot_net[clean_name].dropna()
         if len(net_series) == 0:
             continue
 
@@ -116,7 +142,7 @@ def main():
 
         avg_3m = net_series.tail(12).mean()
 
-        # 1Y Metrics
+        # 1Y Metrics (52 weeks)
         net_1y = net_series.tail(52)
         avg_1y, min_1y, max_1y, std_1y = net_1y.mean(), net_1y.min(), net_1y.max(), net_1y.std()
         z_1y = compute_z_score(latest_val, avg_1y, std_1y)
